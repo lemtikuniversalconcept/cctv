@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: lemtik-cctv-perception
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: REQUIRE_RELATIONSHIP_CLIENT
+        value: "true"
+      - key: RELATIONSHIP_CLIENT_NAME
+        value: relationship-api
+      - key: DATABASE_URL
+        sync: false
+      - key: QWEN_API_KEY
+        sync: false
