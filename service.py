@@ -46,6 +46,32 @@ def _stable_embedding(seed: str, size: int = 32) -> list[float]:
     return values
 
 
+def _bbox_aspect_ratio(bbox: Any) -> float | None:
+    if not isinstance(bbox, dict):
+        return None
+    width = float(bbox.get("w") or bbox.get("width") or 0)
+    height = float(bbox.get("h") or bbox.get("height") or 0)
+    if not height:
+        return None
+    return round(width / height, 4)
+
+
+def fallback_embedding_seed(payload: dict[str, Any], camera: dict[str, Any] | None = None) -> str:
+    attributes = payload.get("attributes") or {}
+    bbox = payload.get("bbox") or {}
+    visual_seed = {
+        "camera_id": payload.get("camera_id") or (camera or {}).get("camera_id"),
+        "zone": payload.get("zone") or (camera or {}).get("zone"),
+        "bbox_aspect_ratio": _bbox_aspect_ratio(bbox),
+        "clothing": attributes.get("clothing") or attributes.get("upper_clothing") or attributes.get("dominant_clothing"),
+        "body_shape": attributes.get("body_shape"),
+        "colors": attributes.get("colors") or attributes.get("dominant_colors") or [],
+        "accessories": attributes.get("accessories") or [],
+        "motion": attributes.get("motion_characteristics") or payload.get("movement_vector") or {},
+    }
+    return json.dumps(visual_seed, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     if not a or not b:
         return 0.0
@@ -176,7 +202,7 @@ class CCTVPerceptionService:
         target_id = str(payload.get("target_id") or "").strip()
         embedding = payload.get("embedding")
         if not isinstance(embedding, list) or not embedding:
-            embedding = _stable_embedding(json.dumps({"camera_id": camera_id, "bbox": payload.get("bbox"), "snapshot": payload.get("snapshot_ref"), "attributes": payload.get("attributes")}, sort_keys=True))
+            embedding = _stable_embedding(fallback_embedding_seed(payload, camera))
         descriptors = self._visual_descriptors(payload)
         continuity = self._tracking_continuity(org_id, embedding, target_id, payload=payload, camera=camera)
         if not target_id:

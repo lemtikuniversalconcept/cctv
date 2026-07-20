@@ -9,7 +9,7 @@ os.environ.setdefault("INTERNAL_API_KEY", "dev-internal-key")
 os.environ["LOCAL_DATABASE_PATH"] = str(Path(tempfile.gettempdir()) / "cctvai_test.db")
 
 from config import load_settings
-from service import CCTVPerceptionService
+from service import CCTVPerceptionService, _stable_embedding, fallback_embedding_seed
 from storage import CCTVStore
 
 
@@ -150,3 +150,23 @@ def test_mcmot_blind_spot_and_access_trigger_context() -> None:
     assert result["qwen_verification"]["status"] == "recommended"
     assert result["qwen_verification"]["relationship_api_delivery"]["status"] == "not_configured"
     assert result["safety"]["decision_boundary"] == "perception_only"
+
+
+def test_lightweight_fallback_embedding_uses_visual_shape_inputs() -> None:
+    payload_a = {
+        "camera_id": "CCTV-1",
+        "zone": "Gate",
+        "bbox": {"x": 1, "y": 2, "w": 50, "h": 150},
+        "attributes": {"clothing": "dark hoodie", "dominant_colors": ["black"], "accessories": ["backpack"]},
+        "movement_vector": {"direction": "east"},
+    }
+    payload_b = {
+        **payload_a,
+        "bbox": {"x": 99, "y": 30, "w": 50, "h": 150},
+    }
+    payload_c = {
+        **payload_a,
+        "attributes": {"clothing": "white shirt", "dominant_colors": ["white"], "accessories": []},
+    }
+    assert _stable_embedding(fallback_embedding_seed(payload_a)) == _stable_embedding(fallback_embedding_seed(payload_b))
+    assert _stable_embedding(fallback_embedding_seed(payload_a)) != _stable_embedding(fallback_embedding_seed(payload_c))
