@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -12,8 +13,19 @@ try:
 except Exception:  # pragma: no cover - optional until Qwen calls are enabled
     httpx = None  # type: ignore
 
+import blob_storage
+import vision
 from config import Settings
 from storage import CCTVStore, now_iso
+
+SYNTHETIC_EMBEDDING_SOURCE = "synthetic_fallback"
+REAL_EMBEDDING_SOURCE = "color_histogram_v1"
+
+
+def _strip_data_url(frame_data: str) -> str:
+    if frame_data.startswith("data:") and ";base64," in frame_data:
+        return frame_data.split(";base64,", 1)[1]
+    return frame_data
 
 
 QWEN_TRIGGER_EVENTS = {
@@ -105,11 +117,20 @@ class CCTVPerceptionService:
                 "blind_spot_prediction": True,
                 "qwen_vision": bool(self.settings.qwen_api_key),
                 "ai_orchestrator_push": bool(self.settings.ai_orchestrator_url),
+                "frame_object_detection": vision.detector_available(),
+                "frame_archival": blob_storage.r2_configured(),
             },
             "models": {
-                "detector": "adapter-ready",
+                # Real when the ONNX runtime + model file are present (checked at request time,
+                # not just installed) - "unavailable" if either is missing, never a name implying
+                # detection ran when it silently didn't.
+                "detector": "yolox_nano_onnx" if vision.detector_available() else "unavailable",
                 "tracker": "bytetrack-compatible",
-                "reid": "embedding-compatible",
+                # Re-id runs on a real HSV color-histogram of the detected subject's crop when a
+                # frame is supplied (honest, modest accuracy - clothing-color similarity, not
+                # biometric identity) - falls back to a synthetic hash of caller-supplied text
+                # labels when no image is available, labeled as such in every response.
+                "reid": REAL_EMBEDDING_SOURCE if vision.detector_available() else SYNTHETIC_EMBEDDING_SOURCE,
                 "vision": self.settings.qwen_vision_model,
                 "vision_protocol": self.settings.qwen_api_protocol,
                 "vision_base_url": self.settings.qwen_base_url,
@@ -201,8 +222,14 @@ class CCTVPerceptionService:
             camera = self.store.get_camera(camera_id)
         target_id = str(payload.get("target_id") or "").strip()
         embedding = payload.get("embedding")
+        # embedding_source travels with the embedding so _tracking_continuity can be honest about
+        # what basis a similarity match was actually computed on, instead of defaulting to a label
+        # ("fastreid_or_adapter_embedding") that implies a real re-id model ran when none did.
+        embedding_source = payload.get("embedding_source")
         if not isinstance(embedding, list) or not embedding:
             embedding = _stable_embedding(fallback_embedding_seed(payload, camera))
+            embedding_source = embedding_source or SYNTHETIC_EMBEDDING_SOURCE
+        payload = {**payload, "embedding_source": embedding_source}
         descriptors = self._visual_descriptors(payload)
         continuity = self._tracking_continuity(org_id, embedding, target_id, payload=payload, camera=camera)
         if not target_id:
@@ -241,6 +268,8 @@ class CCTVPerceptionService:
                 "tracking_continuity": continuity,
                 "similarity_score": continuity.get("similarity"),
                 "identity_assertion": False,
+                "image_key": payload.get("image_key"),
+                "raw_detections": payload.get("raw_detections") or [],
             }
         )
         trigger_delivery = None
@@ -262,31 +291,62 @@ class CCTVPerceptionService:
         if not frame_data:
             raise ValueError("frame_data is required")
         frame_hash = hashlib.sha256(frame_data.encode("utf-8")).hexdigest()[:16]
-        telemetry = self._ingest_telemetry_authorized(
-            {
-                "request_id": payload.get("request_id"),
-                "org_id": payload.get("org_id"),
-                "camera_id": payload.get("camera_id") or "PHONE-CAMERA-TEST",
-                "target_id": payload.get("target_id"),
-                "camera_name": payload.get("camera_name") or "Phone Camera Test",
-                "zone": payload.get("zone") or "Phone Test Zone",
-                "event_type": payload.get("event_type") or "manual_operator_verification",
-                "event_confidence": payload.get("event_confidence", 0.8),
-                "bbox": payload.get("bbox") or {"source": "phone_snapshot", "frame_hash": frame_hash},
-                "movement_vector": payload.get("movement_vector") or {},
-                "snapshot_ref": f"phone-frame:{frame_hash}",
-                "analysis_image_url": frame_data,
-                "attributes": {
-                    **(payload.get("attributes") or {}),
-                    "source": "phone_camera",
-                    "test_session_id": payload.get("test_session_id"),
-                    "voice_transcript": payload.get("voice_transcript"),
-                },
-            }
-        )
-        vision = None
+        org_id = str(payload.get("org_id") or "").strip()
+
+        # Real detection: decode the actual image and run YOLOX-Nano on it, rather than trusting
+        # whatever bbox (if any) the caller happened to supply. detections/subject are [] / None
+        # on any failure (bad image, model unavailable) - the telemetry call below already
+        # handles a missing bbox/embedding honestly, so this never blocks ingestion.
+        decoded_image = vision.decode_image(frame_data)
+        detections = vision.detect_objects(decoded_image) if decoded_image is not None else []
+        subject = vision.primary_subject(detections)
+
+        image_key = None
+        if decoded_image is not None:
+            try:
+                raw_bytes = base64.b64decode(_strip_data_url(frame_data), validate=False)
+                image_key = blob_storage.upload_bytes(f"cctvai/frames/{org_id}/{frame_hash}.jpg", raw_bytes, "image/jpeg")
+            except Exception:
+                image_key = None
+
+        embedding = None
+        embedding_source = None
+        if subject is not None:
+            embedding = vision.color_histogram_embedding(decoded_image, subject["bbox"])
+            embedding_source = REAL_EMBEDDING_SOURCE if embedding else None
+
+        telemetry_payload: dict[str, Any] = {
+            "request_id": payload.get("request_id"),
+            "org_id": payload.get("org_id"),
+            "camera_id": payload.get("camera_id") or "PHONE-CAMERA-TEST",
+            "target_id": payload.get("target_id"),
+            "camera_name": payload.get("camera_name") or "Phone Camera Test",
+            "zone": payload.get("zone") or "Phone Test Zone",
+            "event_type": payload.get("event_type") or "manual_operator_verification",
+            "event_confidence": payload.get("event_confidence", 0.8),
+            "bbox": subject["bbox"] if subject else (payload.get("bbox") or {"source": "phone_snapshot", "frame_hash": frame_hash}),
+            "movement_vector": payload.get("movement_vector") or {},
+            "snapshot_ref": f"phone-frame:{frame_hash}",
+            "image_key": image_key,
+            "analysis_image_url": frame_data,
+            "detected_class": subject["class_name"] if subject else None,
+            "detection_confidence": subject["confidence"] if subject else None,
+            "raw_detections": detections[:10],
+            "attributes": {
+                **(payload.get("attributes") or {}),
+                "source": "phone_camera",
+                "test_session_id": payload.get("test_session_id"),
+                "voice_transcript": payload.get("voice_transcript"),
+            },
+        }
+        if embedding:
+            telemetry_payload["embedding"] = embedding
+            telemetry_payload["embedding_source"] = embedding_source
+        telemetry = self._ingest_telemetry_authorized(telemetry_payload)
+
+        vision_result = None
         if payload.get("verify_vision"):
-            vision = await self.verify_vision(
+            vision_result = await self.verify_vision(
                 {
                     "request_id": payload.get("request_id"),
                     "org_id": payload.get("org_id"),
@@ -299,7 +359,15 @@ class CCTVPerceptionService:
                 },
                 internal_key,
             )
-        return {"status": "success", "frame_hash": frame_hash, "telemetry_result": telemetry, "vision_result": vision}
+        return {
+            "status": "success",
+            "frame_hash": frame_hash,
+            "image_key": image_key,
+            "detections": detections[:10],
+            "primary_subject": subject,
+            "telemetry_result": telemetry,
+            "vision_result": vision_result,
+        }
 
     def _visual_descriptors(self, payload: dict[str, Any]) -> dict[str, Any]:
         attributes = payload.get("attributes") or {}
@@ -313,15 +381,23 @@ class CCTVPerceptionService:
         accessories = attributes.get("accessories") or []
         descriptor_fields = [clothing, body_shape, colors, accessories, aspect_ratio]
         confidence = min(1.0, 0.2 + 0.16 * sum(1 for item in descriptor_fields if item not in (None, "", [], {})))
+        # detected_class/detection_confidence only appear when ingest_frame ran real YOLOX
+        # detection on an actual image - bbox_aspect_ratio and body_shape in that case are
+        # derived from a real detected bounding box, not a caller-supplied or estimated one.
+        # Clothing/colors/accessories are never detected (the object detector has no attribute
+        # classification head), so those stay "provided_or_estimated" regardless.
+        bbox_source = "detected" if payload.get("detected_class") else "provided_or_estimated"
         return {
             "clothing": clothing,
             "body_shape": body_shape,
             "dominant_colors": colors,
             "accessories": accessories,
             "bbox_aspect_ratio": aspect_ratio,
+            "detected_class": payload.get("detected_class"),
+            "detection_confidence": payload.get("detection_confidence"),
             "motion_characteristics": attributes.get("motion_characteristics") or payload.get("movement_vector") or {},
             "descriptor_confidence": round(confidence, 3),
-            "source": "provided_or_estimated",
+            "source": bbox_source,
         }
 
     def _body_shape_from_bbox(self, aspect_ratio: float | None) -> str | None:
@@ -351,7 +427,7 @@ class CCTVPerceptionService:
                 "similarity": 1.0,
                 "confidence": 1.0,
                 "threshold": self.settings.default_reid_threshold,
-                "embedding_source": payload.get("embedding_source") or "fastreid_or_adapter_embedding",
+                "embedding_source": payload.get("embedding_source") or SYNTHETIC_EMBEDDING_SOURCE,
                 "blind_spot_prediction": blind_spot,
                 "mcmot_enabled": True,
                 "identity_claim": False,
@@ -390,7 +466,7 @@ class CCTVPerceptionService:
             "possible_match_below_threshold": possible,
             "best_candidate": best,
             "candidates": candidates[:5],
-            "embedding_source": payload.get("embedding_source") or "fastreid_or_adapter_embedding",
+            "embedding_source": payload.get("embedding_source") or SYNTHETIC_EMBEDDING_SOURCE,
             "blind_spot_prediction": blind_spot,
             "mcmot_enabled": True,
             "identity_claim": False,
