@@ -18,6 +18,9 @@ class Settings:
     qwen_base_url: str
     qwen_vision_model: str
     qwen_api_protocol: str
+    groq_api_key: str | None
+    groq_base_url: str
+    groq_vision_model: str
     require_relationship_client: bool
     relationship_client_name: str
     environment: str
@@ -58,6 +61,12 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         qwen_base_url=os.getenv("QWEN_BASE_URL", "https://dashscope-us.aliyuncs.com/api/v1").strip().rstrip("/"),
         qwen_vision_model=os.getenv("QWEN_VISION_MODEL", "qwen3-vl-flash-us").strip(),
         qwen_api_protocol=os.getenv("QWEN_API_PROTOCOL", "dashscope").strip().lower(),
+        # Free, no-credit-card fallback for vision when Qwen is unconfigured or its
+        # account has run out of credits (Qwen has no free tier of its own) - same
+        # provider masterai already uses for text and now vision too.
+        groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
+        groq_base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip().rstrip("/"),
+        groq_vision_model=os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip(),
         require_relationship_client=os.getenv("REQUIRE_RELATIONSHIP_CLIENT", "true" if environment == "production" else "false").strip().lower() in {"1", "true", "yes"},
         relationship_client_name=os.getenv("RELATIONSHIP_CLIENT_NAME", "relationship-api").strip(),
         environment=environment,

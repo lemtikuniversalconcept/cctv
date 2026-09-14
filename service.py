@@ -116,6 +116,7 @@ class CCTVPerceptionService:
                 "reid_matching": True,
                 "blind_spot_prediction": True,
                 "qwen_vision": bool(self.settings.qwen_api_key),
+                "groq_vision": bool(self.settings.groq_api_key),
                 "ai_orchestrator_push": bool(self.settings.ai_orchestrator_url),
                 "frame_object_detection": vision.detector_available(),
                 "frame_archival": blob_storage.r2_configured(),
@@ -786,14 +787,28 @@ class CCTVPerceptionService:
         event_type = str(payload.get("event_type") or "manual_operator_verification")
         analysis: dict[str, Any]
         provider = "heuristic-fallback"
-        if self.settings.qwen_api_key and payload.get("snapshots"):
-            try:
-                analysis = await self._call_qwen_vision(payload)
-                provider = "qwen"
-            except Exception as exc:
-                analysis = self._fallback_vision(payload, f"Qwen vision unavailable: {exc}")
+        if not payload.get("snapshots"):
+            analysis = self._fallback_vision(payload, "No snapshots supplied.")
         else:
-            analysis = self._fallback_vision(payload, "Qwen vision not configured or no snapshots supplied.")
+            qwen_error: str | None = None
+            if self.settings.qwen_api_key:
+                try:
+                    analysis = await self._call_qwen_vision(payload)
+                    provider = "qwen"
+                except Exception as exc:
+                    qwen_error = str(exc)
+            if provider != "qwen":
+                if self.settings.groq_api_key:
+                    try:
+                        analysis = await self._call_groq_vision(payload)
+                        provider = "groq"
+                    except Exception as exc:
+                        note = f"Qwen vision unavailable ({qwen_error}); Groq vision also unavailable: {exc}" if qwen_error else f"Groq vision unavailable: {exc}"
+                        analysis = self._fallback_vision(payload, note)
+                elif qwen_error:
+                    analysis = self._fallback_vision(payload, f"Qwen vision unavailable: {qwen_error}")
+                else:
+                    analysis = self._fallback_vision(payload, "No vision provider configured (Qwen and Groq both unset).")
         event = self.store.add_vision_event(
             {
                 "request_id": payload.get("request_id"),
@@ -879,6 +894,46 @@ class CCTVPerceptionService:
             response = await client.post(
                 f"{self.settings.qwen_base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.settings.qwen_api_key}", "Content-Type": "application/json"},
+                json=body,
+            )
+            response.raise_for_status()
+            data = response.json()
+            raw = data["choices"][0]["message"]["content"]
+            return self._parse_vision_json(raw, data)
+
+    async def _call_groq_vision(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # Same request shape as _call_qwen_vision_openai - Groq's chat/completions API is
+        # OpenAI-compatible, and this is the free fallback for when Qwen isn't configured
+        # or its account has run out of credits.
+        if httpx is None:
+            raise RuntimeError("httpx is not installed")
+        snapshots = payload.get("snapshots") or []
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "You are the vision verification layer for Lemtik Security. Return only JSON with "
+                    "threat_summary, confidence, visual_explanation, recommended_follow_up_actions, gaps, and identity_claim=false. "
+                    "Do not infer personal identity."
+                ),
+            }
+        ]
+        for snapshot in snapshots[:4]:
+            if isinstance(snapshot, str):
+                content.append({"type": "image_url", "image_url": {"url": snapshot}})
+            elif isinstance(snapshot, dict) and snapshot.get("url"):
+                content.append({"type": "image_url", "image_url": {"url": snapshot["url"]}})
+        content.append({"type": "text", "text": json.dumps({"event": payload.get("event_type"), "metadata": payload.get("metadata"), "incident_context": payload.get("incident_context")}, default=str)})
+        body = {
+            "model": self.settings.groq_vision_model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.settings.groq_base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.settings.groq_api_key}", "Content-Type": "application/json"},
                 json=body,
             )
             response.raise_for_status()
