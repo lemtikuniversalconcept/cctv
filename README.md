@@ -77,3 +77,13 @@ http://127.0.0.1:8010/api/v1/cctv/phone-test
 
 The page can use a browser camera, capture a frame, and send it to `/frames/ingest`.
 For a physical phone on the same Wi-Fi, run the server on an address reachable from the phone and open the machine IP instead of `127.0.0.1`.
+
+## License
+
+Proprietary — All Rights Reserved. See [LICENSE](./LICENSE). This code is
+shared publicly for evaluation purposes only; it is not licensed for reuse,
+modification, or redistribution.
+
+---
+
+© 2026 Lemtik Security. All rights reserved.
